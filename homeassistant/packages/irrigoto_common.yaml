@@ -168,14 +168,45 @@ automation:
           zones: >-
             {{ state_attr('sensor.' ~ usc ~ '_schedule_rest', 'zones')
                | default([], true) }}
+          # Build the Zone dropdown options. Prefer the device's LIVE zone list
+          # (schedule_rest). When the device is asleep that's empty, so fall
+          # back to the per-device cached overview selector
+          # input_select.<usc>_water_zone -- the SAME source the overview's
+          # "Current zone / mode" picker shows, which retains its options
+          # through sleep and across HA restarts. This keeps the schedule
+          # dropdown populated even for a device that's asleep when you switch
+          # to it. The overview list is unfiltered "<name> (#<id>)"; drop the
+          # unconfigured id-0 "Zone" placeholder to match the live path.
           zopts: >-
             {%- set ns = namespace(o=[]) -%}
-            {%- for z in zones if (z.id | int(-1)) >= 0 and z.name != 'Zone' -%}
-              {%- set ns.o = ns.o + [z.name ~ ' (#' ~ (z.id | string) ~ ')'] -%}
-            {%- endfor -%}
-            {{ ns.o if (ns.o | count > 0) else ['(no zones)'] }}
-      - action: input_select.set_options
-        target:
-          entity_id: input_select.irrigoto_compose_zone
-        data:
-          options: "{{ zopts }}"
+            {%- if zones | count > 0 -%}
+              {%- for z in zones if (z.id | int(-1)) >= 0 and z.name != 'Zone' -%}
+                {%- set ns.o = ns.o + [z.name ~ ' (#' ~ (z.id | string) ~ ')'] -%}
+              {%- endfor -%}
+            {%- else -%}
+              {%- set cached = states('input_text.' ~ usc ~ '_zone_cache') | default('[]', true) -%}
+              {%- set clist = (cached | from_json) if cached.startswith('[') else [] -%}
+              {%- for o in clist if '(#' in o and o.split(' (#')[0] != 'Zone' -%}
+                {%- set ns.o = ns.o + [o] -%}
+              {%- endfor -%}
+            {%- endif -%}
+            {{ ns.o }}
+      # Refresh from the live list (awake) or the durable per-device cache
+      # (asleep, restart-safe). If NEITHER is available -- a device never seen
+      # awake -- show a clear placeholder rather than RETAINING the previously
+      # shown device's zones, which would let you schedule the wrong zone.
+      - if:
+          - condition: template
+            value_template: "{{ zopts | count > 0 }}"
+        then:
+          - action: input_select.set_options
+            target:
+              entity_id: input_select.irrigoto_compose_zone
+            data:
+              options: "{{ zopts }}"
+        else:
+          - action: input_select.set_options
+            target:
+              entity_id: input_select.irrigoto_compose_zone
+            data:
+              options: ["(wake device to load zones)"]

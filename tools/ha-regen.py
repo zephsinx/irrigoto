@@ -153,6 +153,12 @@ def render_once(src: Path, devices, manifest_rel: str) -> str:
     text = subst_scalar(text, "<<DEVICE_NAME_SLUG_MAP>>", name_slug_map)
     text = subst_list(text, "<<DEVICE_REST_SENSORS>>",
                       [f'sensor.{d["usc"]}_schedule_rest' for d in devices])
+    # Jinja-literal device lists/maps for COMMON templates that must iterate the
+    # whole fleet inside ONE template (e.g. the per-device-slots aggregator).
+    usc_dash_map = "{" + ", ".join(f'"{d["usc"]}": "{d["slug"]}"' for d in devices) + "}"
+    text = subst_scalar(text, "<<DEVICE_USC_DASH_MAP>>", usc_dash_map)
+    dash_usc_map = "{" + ", ".join(f'"{d["slug"]}": "{d["usc"]}"' for d in devices) + "}"
+    text = subst_scalar(text, "<<DEVICE_DASH_USC_MAP>>", dash_usc_map)
     text = expand_blocks(text, devices)
     return gen_header(src.relative_to(ROOT).as_posix(), manifest_rel, len(devices)) + "\n" + text
 

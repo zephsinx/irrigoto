@@ -60,6 +60,30 @@ input_text:
     icon: mdi:counter
     max: 16
     initial: "0"
+  # Durable cache of this device's zone-picker options ("<name> (#<id>)" JSON),
+  # refreshed whenever the device is awake. input_text values are restored
+  # across HA restarts, whereas input_select.set_options is NOT -- so this is
+  # what lets the zone pickers (overview + schedule compose) still show a
+  # device's zones while it's asleep, even right after a restart.
+  <<DEV_USC>>_zone_cache:
+    name: "irrigoto <<DEV_DASH>> zone cache"
+    icon: mdi:playlist-check
+    max: 255
+    initial: "[]"
+  # Per-device schedule slots. Each device owns its OWN sequential slots 1..8
+  # (replacing the old 10 globally-shared input_text.irrigoto_sched_N slots,
+  # which collided across devices and left entries with no slot number). Value
+  # format is a flat CSV: id,lm,zone,mode,depth,hour,minute,days_mask,enabled
+  # (empty string = unused). The device is implied by which input_text holds it,
+  # so there is no "dev|" prefix anymore.
+  <<DEV_USC>>_sched_1: {name: "<<DEV_DASH>> sched slot 1", max: 96, initial: ""}
+  <<DEV_USC>>_sched_2: {name: "<<DEV_DASH>> sched slot 2", max: 96, initial: ""}
+  <<DEV_USC>>_sched_3: {name: "<<DEV_DASH>> sched slot 3", max: 96, initial: ""}
+  <<DEV_USC>>_sched_4: {name: "<<DEV_DASH>> sched slot 4", max: 96, initial: ""}
+  <<DEV_USC>>_sched_5: {name: "<<DEV_DASH>> sched slot 5", max: 96, initial: ""}
+  <<DEV_USC>>_sched_6: {name: "<<DEV_DASH>> sched slot 6", max: 96, initial: ""}
+  <<DEV_USC>>_sched_7: {name: "<<DEV_DASH>> sched slot 7", max: 96, initial: ""}
+  <<DEV_USC>>_sched_8: {name: "<<DEV_DASH>> sched slot 8", max: 96, initial: ""}
 
 # b311: chase-mode duration shared across all zones. 1..10 minutes,
 # 1-minute steps. The chase scripts read this and pass it to the
@@ -1486,12 +1510,17 @@ template:
               {%- endif -%}
             {%- endfor -%}
             {%- set ha_ids = entries | map(attribute='id') | map('int') | list -%}
+            {#- Tombstones are gated behind the override (see sync_payload):
+                upsert-only by default, so don't count would-be tombstones
+                unless the user has explicitly opted into deletes. -#}
+            {%- if is_state('input_boolean.irrigoto_schedule_overlap_override', 'on') -%}
             {%- for d in dev_entries -%}
               {%- set idn = d.id | int(0) -%}
               {%- if idn > 0 and idn not in ha_ids -%}
                 {%- set ns.c = ns.c + 1 -%}
               {%- endif -%}
             {%- endfor -%}
+            {%- endif -%}
             {{ ns.c }}
           # sync_payload: the ';'-separated wire format for sync_schedule.
           # For each HA slot we emit an upsert with the slot's id+lm and
@@ -1532,6 +1561,18 @@ template:
               {%- endif -%}
             {%- endfor -%}
             {%- set ha_ids = entries | map(attribute='id') | map('int') | list -%}
+            {#- DESTRUCTIVE: tombstones tell the device to DELETE an entry.
+                These were the vector for repeated schedule wipes -- when HA's
+                mirrored view was incomplete (a stale REST poll during a sync
+                storm), the "device id not in HA" test tombstoned LIVE entries.
+                The reconciler's full-empty guard only caught the 0-entry case,
+                never a partial view (e.g. HA shows 1 of 3 -> wipes the other 2).
+                Default is now UPSERT-ONLY: never auto-emit tombstones, so a sync
+                can only ADD/UPDATE device entries, never delete them. To delete:
+                clear the entry on the device web UI, or flip
+                input_boolean.irrigoto_schedule_overlap_override to push deletes
+                deliberately (then turn it back off). -#}
+            {%- if is_state('input_boolean.irrigoto_schedule_overlap_override', 'on') -%}
             {%- for d in dev_entries -%}
               {%- set idn = d.id | int(0) -%}
               {%- if idn > 0 and idn not in ha_ids -%}
@@ -1540,6 +1581,7 @@ template:
                 {%- set ns.lines = ns.lines + [line] -%}
               {%- endif -%}
             {%- endfor -%}
+            {%- endif -%}
             {{ ns.lines | join(';') }}
 
       # b355: pending-OUTBOUND -- "HA has changes to push to the device."
@@ -1941,16 +1983,14 @@ automation:
         attribute: schedule_version
       - trigger: state
         entity_id:
-          - input_text.irrigoto_sched_1
-          - input_text.irrigoto_sched_2
-          - input_text.irrigoto_sched_3
-          - input_text.irrigoto_sched_4
-          - input_text.irrigoto_sched_5
-          - input_text.irrigoto_sched_6
-          - input_text.irrigoto_sched_7
-          - input_text.irrigoto_sched_8
-          - input_text.irrigoto_sched_9
-          - input_text.irrigoto_sched_10
+          - input_text.<<DEV_USC>>_sched_1
+          - input_text.<<DEV_USC>>_sched_2
+          - input_text.<<DEV_USC>>_sched_3
+          - input_text.<<DEV_USC>>_sched_4
+          - input_text.<<DEV_USC>>_sched_5
+          - input_text.<<DEV_USC>>_sched_6
+          - input_text.<<DEV_USC>>_sched_7
+          - input_text.<<DEV_USC>>_sched_8
     conditions:
       - condition: state
         entity_id: binary_sensor.<<DEV_USC>>_irrigoto_online
@@ -1974,9 +2014,13 @@ automation:
             {%- set v = states('input_text.<<DEV_USC>>_last_seen_schedule_version')
                         | default('0', true) -%}
             {{ (v if v not in ['unknown', 'unavailable', 'none'] else '0') | int(0) }}
+      # PULL disabled: the b359 mirror_device_schedule_to_slots automation now
+      # does the device->HA pull into per-device slots. This legacy global-slot
+      # PULL is kept (gated off) only to preserve the structure/history; it must
+      # never run. (last_seen_version is stamped by track_schedule_version.)
       - if:
           - condition: template
-            value_template: "{{ dev_v > ha_v and dev_v > 0 }}"
+            value_template: "{{ false }}"
         then:
           # Walk this device's by_id; for each device entry, find the
           # HA slot that already references its id (if any). If found,
@@ -2219,15 +2263,38 @@ automation:
               {%- set ns.o = ns.o + [z.name ~ ' (#' ~ (z.id | string) ~ ')'] -%}
             {%- endfor -%}
             {{ ns.o }}
-      - if:
-          - condition: template
-            value_template: "{{ opts | count > 0 }}"
-        then:
-          - action: input_select.set_options
-            target:
-              entity_id: input_select.<<DEV_USC>>_water_zone
-            data:
-              options: "{{ opts }}"
+      - choose:
+          # Device awake with a live zone list: set the picker AND refresh the
+          # durable cache (input_text survives restarts; set_options does not).
+          - conditions:
+              - condition: template
+                value_template: "{{ opts | count > 0 }}"
+            sequence:
+              - action: input_select.set_options
+                target:
+                  entity_id: input_select.<<DEV_USC>>_water_zone
+                data:
+                  options: "{{ opts }}"
+              - action: input_text.set_value
+                target:
+                  entity_id: input_text.<<DEV_USC>>_zone_cache
+                data:
+                  value: "{{ opts | to_json }}"
+        # Device asleep / no live list (e.g. right after an HA restart): restore
+        # the picker from the durable cache so it isn't left blank or stale.
+        default:
+          - variables:
+              cached: "{{ states('input_text.<<DEV_USC>>_zone_cache') | default('[]', true) }}"
+          - if:
+              - condition: template
+                value_template: >-
+                  {{ cached.startswith('[') and (cached | from_json | count) > 0 }}
+            then:
+              - action: input_select.set_options
+                target:
+                  entity_id: input_select.<<DEV_USC>>_water_zone
+                data:
+                  options: "{{ cached | from_json }}"
 
   # b359: mirror device schedule into HA slots via the schedule_rest
   # sensor. Triggers on EITHER:
@@ -2264,18 +2331,39 @@ automation:
         entity_id: sensor.<<DEV_USC>>_schedule_rest
       - trigger: event
         event_type: esphome.<<DEV_DASH>>_schedule_changed
+      # Deep-sleep devices have wake windows shorter than the 30s REST poll,
+      # so the poll often misses them and HA's slots never refill after a wipe.
+      # Re-pull the instant the device connects (its wake window is long enough
+      # for one forced HTTP fetch -- same window the heatmap bootstrap uses).
+      - trigger: state
+        entity_id: binary_sensor.<<DEV_USC>>_irrigoto_online
+        from: "off"
+        to: "on"
+      # Re-mirror on HA start so a restart RECOVERS a partial/stale pull.
+      - trigger: homeassistant
+        event: start
     actions:
-      # If we're firing from the event, the REST sensor's cached data
-      # is stale (next poll is up to 30s away). Force-refresh it now
-      # so the mirror writes the fresh entries+IDs.
+      # On the schedule_changed event, the online edge, or HA start, the cached
+      # REST data can be stale (next scheduled poll up to 30s away). Force a
+      # re-poll and WAIT until it actually catches up to the device's current
+      # schedule_version (from schedule_full, which is event-driven / immediate)
+      # before reading entries. A fixed delay raced the HTTP fetch and pulled a
+      # partial/stale list, which left entries stuck "pending pull" with no
+      # re-trigger once the version settled.
       - if:
           - condition: template
-            value_template: "{{ trigger.platform == 'event' }}"
+            value_template: >-
+              {{ trigger.platform in ['event', 'homeassistant']
+                 or trigger.entity_id == 'binary_sensor.<<DEV_USC>>_irrigoto_online' }}
         then:
           - action: homeassistant.update_entity
             target:
               entity_id: sensor.<<DEV_USC>>_schedule_rest
-          - delay: "00:00:02"
+          - wait_template: >-
+              {{ (state_attr('sensor.<<DEV_USC>>_schedule_rest', 'schedule_version') | int(-1))
+                 >= (state_attr('sensor.<<DEV_USC>>_schedule_full', 'schedule_version') | int(0)) }}
+            timeout: "00:00:20"
+            continue_on_timeout: true
       - delay: "00:00:01"
       # b359: SAFETY GUARD against device-offline scenarios. When the
       # device goes to sleep / loses WiFi, the REST poll fails and the
@@ -2299,8 +2387,10 @@ automation:
           entries: >-
             {{ state_attr('sensor.<<DEV_USC>>_schedule_rest', 'entries')
                | default([], true) }}
+      # Per-device slots: write THIS device's entries into ITS OWN slots 1..8
+      # by position. No cross-device collision or ownership checks needed.
       - repeat:
-          for_each: [1,2,3,4,5,6,7,8,9,10]
+          for_each: [1,2,3,4,5,6,7,8]
           sequence:
             - variables:
                 slot_n: "{{ repeat.item | int(0) }}"
@@ -2308,20 +2398,15 @@ automation:
                 dev_e: >-
                   {{ entries[dev_idx] if dev_idx < (entries | count) else none }}
                 slot_raw: >-
-                  {{ states('input_text.irrigoto_sched_' ~ slot_n) | default('', true) | trim }}
-                slot_belongs_to_us: >-
-                  {{ '<<DEV_DASH>>|' in slot_raw }}
-                slot_head: >-
-                  {%- if '|' in slot_raw -%}{{ slot_raw.split('|', 1)[0] }}{%- else -%}{%- endif -%}
+                  {{ states('input_text.<<DEV_USC>>_sched_' ~ slot_n) | default('', true) | trim }}
                 slot_lm: >-
-                  {%- set head = slot_head -%}
-                  {%- if ',' in head and head.split(',') | length >= 2 -%}
-                    {{ head.split(',')[1] | int(0) }}
-                  {%- else -%}0{%- endif -%}
+                  {# slot_raw arrives as a HA TupleWrapper across the variables
+                     block; force | string before .split (see compose load). #}
+                  {%- set f = (slot_raw | string).split(',') -%}
+                  {%- if f | length >= 2 -%}{{ f[1] | int(0) }}{%- else -%}0{%- endif -%}
             - choose:
-                # Case A: device has an entry for this slot. Write it
-                # unless the HA slot's stored lm is newer (user mid-edit
-                # — let the reconciler PUSH it instead).
+                # Device has an entry at this position: write it unless the HA
+                # slot's lm is newer (user mid-edit — the PUSH will sync it).
                 - conditions: "{{ dev_e is not none }}"
                   sequence:
                     - if:
@@ -2331,29 +2416,22 @@ automation:
                       then:
                         - action: input_text.set_value
                           target:
-                            entity_id: "input_text.irrigoto_sched_{{ slot_n }}"
+                            entity_id: "input_text.<<DEV_USC>>_sched_{{ slot_n }}"
                           data:
-                            # Zone: convert the device's 1-based schedule zone
-                            # back to HA's 0-based device-id convention (matches
-                            # the "(#id)" dropdown and the push side's +1). Clamp
-                            # at 0 defensively. Without this -1 the round-trip
-                            # drifts by one every mirror (device RockGarden #0
-                            # would re-appear in HA as RockGarden_2 #1).
+                            # Flat CSV id,lm,zone,mode,depth,hour,minute,days_mask,enabled.
+                            # Zone: device schedule is 1-based; HA stores 0-based id
+                            # (matches the "(#id)" dropdown + the push side's +1).
                             value: >-
-                              {{ dev_e.id }},{{ dev_e.last_modified
-                              }},<<DEV_DASH>>|{{ [ (dev_e.zone | int(1)) - 1, 0 ] | max
-                              }},{{ dev_e.mode
-                              }},{{ dev_e.depth }},{{ dev_e.hour }},{{
-                              dev_e.minute }},{{ dev_e.days_mask }},{{
-                              dev_e.enabled }}
-                # Case B: device has no entry for this slot index. If
-                # the HA slot belongs to THIS device, clear it. If it's
-                # empty or belongs to another device, leave alone.
-                - conditions: "{{ slot_belongs_to_us }}"
+                              {{ dev_e.id }},{{ dev_e.last_modified }},{{
+                              [ (dev_e.zone | int(1)) - 1, 0 ] | max }},{{ dev_e.mode
+                              }},{{ dev_e.depth }},{{ dev_e.hour }},{{ dev_e.minute
+                              }},{{ dev_e.days_mask }},{{ dev_e.enabled }}
+                # No device entry at this position: clear this device's slot.
+                - conditions: "{{ slot_raw != '' }}"
                   sequence:
                     - action: input_text.set_value
                       target:
-                        entity_id: "input_text.irrigoto_sched_{{ slot_n }}"
+                        entity_id: "input_text.<<DEV_USC>>_sched_{{ slot_n }}"
                       data:
                         value: ""
       - action: logbook.log

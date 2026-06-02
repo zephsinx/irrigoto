@@ -1,221 +1,169 @@
-# Bidirectional HA ↔ device schedule sync — design
+# HA ↔ device schedule sync
 
-Status: design doc, not yet implemented (2026-05-26).
+How the weekly watering schedule stays consistent between Home Assistant and
+an irrigoto device. This documents the system as it is built.
 
-## Goals
+## Behavior
 
-- One canonical schedule, consistent in HA and on the device.
-- Both surfaces can edit (HA dashboard + device web UI).
-- Device runs autonomously when HA is offline; the weekly schedule it
-  has continues firing indefinitely.
-- HA can hold richer logic (weather, soil, calendar) and adjust the
-  schedule; updates flow to the device on next reconnect.
-- Both sides know when there's a pending update in either direction.
-
-## Conflict resolution rule
-
-**Last-writer-wins by per-entry `last_modified` timestamp. Device wins
-on tie.**
-
-In practice ties are vanishingly rare — they'd require two edits in the
-same wall-clock second from two surfaces. The tiebreak rule exists for
-determinism, not to express a value judgement.
+- The device stores its schedule in NVS and **runs it autonomously** — no
+  network or HA required. Whatever schedule it holds keeps firing.
+- You can edit the schedule on **either surface**: the device's built-in web
+  UI (`/schedule`) or the HA dashboard's Compose form.
+- Edits made in HA are held in HA and **pushed to the device when it next
+  connects** (the devices deep-sleep, so this can be on the next wake).
+- Edits made on the device **appear in HA after it connects** and HA polls it.
+- Conflicts resolve **last-writer-wins** by per-entry `last_modified`; the
+  **device wins** an exact-second tie. (Ties are effectively impossible in
+  normal use; the rule exists only for determinism.)
+- **Deleting** an entry is done on the device web UI. HA's sync is
+  **upsert-only** — saving/editing HA slots never deletes device entries (see
+  *Upsert-only* below).
 
 ## Entry schema
 
-Each schedule entry grows three new fields:
+Each schedule entry carries:
 
 | Field | Type | Notes |
 | --- | --- | --- |
-| `id` | uint32 | Sequential, stable across edits, assigned at creation. Persisted in NVS with the entry. |
-| `last_modified` | uint32 | Unix epoch when this entry was last edited. Updated on any field change. |
-| `source` | uint8 | Reserved: who set this entry. `0`=unknown, `1`=user_device, `2`=user_ha, `3`=algorithm. Persisted + sync'd but no behavior wired up yet. |
-| _(existing)_ zone, mode, depth, hour, minute, days_mask, enabled | uint8 ×7 | Unchanged. |
+| `id` | uint32 | Stable across edits, assigned by the device at creation. `id=0` on the wire means "allocate one." |
+| `last_modified` | uint32 | Unix epoch of the last edit. Drives LWW. |
+| `source` | uint8 | Who last wrote it: `0` device/unknown, `2` HA. Diagnostic only. |
+| `zone` | uint8 | **1-based** in the schedule (see *Zone encoding*). |
+| `mode` | uint8 | 0 Pulse, 1 Gentle, 2 Smooth. |
+| `depth` | uint8 | eighths of an inch (1 = 1/8″ … 8 = 1″); `0` = device default. |
+| `hour`,`minute` | uint8 | local time of day. |
+| `days_mask` | uint8 | bit per weekday, Sun=bit0 … Sat=bit6 (e.g. 42 = MWF). |
+| `enabled` | uint8 | 0/1. |
 
-Total entry size: 7 + 4 + 4 + 1 = 16 bytes. With current `SCHEDULE_MAX_ENTRIES`
-the NVS blob grows by ~9 bytes × N entries — negligible.
+A device-wide **`schedule_version`** (uint32, in NVS) increments on every commit
+to the schedule, whatever the source. It is the cheap way both sides detect
+"the other end changed something" without replaying events.
 
-A second uint32 ID counter (`schedule_id_next`) is persisted alongside
-the schedule blob so freshly-created entries always get a unique ID
-even across reboots.
+### Zone encoding (important)
 
-## Schedule version counter
+The firmware uses **two zone conventions**:
 
-A device-wide `schedule_version` (uint32, persisted in NVS) increments
-on every commit to the schedule, regardless of the source. Surfaced
-as `sensor.<<DEV_USC>>_irrigoto_schedule_version` (a regular ESPHome
-sensor — auto-synced on HA reconnect, no event-loss problem).
+- The immediate-water HTTP endpoint `/zone/water` takes a **0-based** zone id.
+- **Schedule entries are 1-based**: the firmware waters `zone − 1`, and
+  `sync_schedule` **rejects** any entry with `zone < 1`.
 
-HA stores `last_seen_schedule_version` per device. Comparing the two
-gives the device→HA pending indicator with no event-replay logic.
+HA stores the **0-based device zone id** everywhere internally (it's what the
+`"Name (#id)"` zone dropdown carries). So the HA↔device boundary converts:
+**push adds 1, pull subtracts 1** (clamped ≥ 0). Get this wrong and either the
+whole sync batch is rejected (`z=0`) or entries land on the wrong zone.
 
-## Firmware additions
-
-### NVS
-
-- New key `sched_ver` (uint32) — schedule_version
-- New key `sched_idnxt` (uint32) — next ID to assign
-- Existing key `schedule` blob — entry struct grows to 16 bytes/entry
-
-### ESPHome services
-
-| Service | Purpose | Behavior |
-| --- | --- | --- |
-| `set_schedule(entries)` | Existing, kept for back-compat. | Legacy REPLACE-ALL (old CSV format, no IDs). Deprecated; only used by tools that haven't been updated. |
-| `sync_schedule(entries)` | New. Merge HA-proposed entries into device's schedule using LWW + device-wins-tiebreak. | See protocol below. |
-| `clear_schedule()` | Existing. | Wipe all. Increments schedule_version. |
-| `delay_schedule_hours(h)` | Existing. | Rain delay; doesn't touch entries, doesn't bump version. |
-
-The new `sync_schedule` payload format (one entry per `;`, fields by `,`):
-
-```
-<id>,<last_modified>,<zone>,<mode>,<depth>,<hour>,<minute>,<days_mask>,<enabled>,<source>,<tombstone>
-```
-
-`tombstone=1` means "delete this ID if present, else no-op." Lets HA
-express deletions without requiring "absence implies delete" — important
-because the new sync_schedule must NOT delete device-only entries that
-HA doesn't know about.
-
-`id=0` means "no ID assigned yet, allocate one." The device assigns the
-next sequential ID and includes it in the next schedule_changed event so
-HA can learn it.
-
-### Sensors / events
-
-- `schedule_version` text_sensor (new) — uint32 as string. Auto-synced
-  to HA on API reconnect.
-- `schedule_text` text_sensor (existing) — kept; format extended to
-  include id + last_modified per entry so HA can parse without a
-  separate fetch.
-- `schedule_changed` event (existing) — payload extended to include
-  `schedule_version` (so HA can update last_seen_version inline) and
-  the structured entries-with-IDs blob.
-
-## HA-side additions
+## Device (firmware) side
 
 ### Storage
+NVS holds the entry blob (schema above), the `schedule_version` counter, and a
+next-id counter so new entries get unique ids across reboots.
 
-Keep the per-slot `input_text` model from Stage 6. Each slot's text
-format grows to include id + last_modified:
+### HTTP API — `GET /api/schedule`
+Returns JSON: `schedule_version`, `max_entries`, `last_status`, `ok`, the
+`entries[]` (full schema), the device's `zones[]` as `{id, name}`, plus
+`next_run` and `last_run`. This is HA's source of truth for the device's
+current schedule (HA polls it; see *Pull* below).
+
+`ok` is `true` when the last sync `last_status` indicates success
+(`"ok…"` / `"sync ok…"`).
+
+### ESPHome service — `sync_schedule(entries)`
+Merges HA-proposed entries into the device schedule with LWW + device-wins-tie.
+Payload is `;`-separated entries, each 11 comma fields:
 
 ```
-<id>,<last_modified>,<dev-slug>|<zone>,<mode>,<depth>,<hour>,<minute>,<days_mask>,<enabled>
+id,last_modified,zone,mode,depth,hour,minute,days_mask,enabled,source,tombstone
 ```
 
-Empty slot = unused. The template sensor that aggregates slots also
-strips/parses the new fields.
+- `id=0` → device allocates the next id (and reports it back via the next
+  poll / event so HA can learn it).
+- `tombstone=1` → delete that id if present, else no-op. Lets a delete be
+  expressed explicitly so the device never deletes entries HA simply didn't
+  mention.
+- **Atomic & range-checked**: a non-tombstone entry with an out-of-range field
+  (notably `zone < 1`) makes the device **reject the entire batch**.
 
-A new `input_text.irrigoto_<<DEV_USC>>_last_seen_version` (per device,
-small int) holds HA's last-known schedule_version for that device.
+### Event — `schedule_changed`
+Fires on any schedule mutation and carries the new `schedule_version`. It does
+**not** carry the entries (the full-entry payload was removed because it
+overflowed the ESPHome API send buffer); HA fetches entries via the HTTP poll
+above. `schedule_version` is also exposed to HA as an attribute on the device's
+`schedule_full` sensor.
+
+## Home Assistant side
+
+### Per-device slot storage
+Each device owns its own slots: `input_text.<dev>_sched_1 … _8`. A slot's value
+is a flat CSV (empty = unused):
+
+```
+id,last_modified,zone,mode,depth,hour,minute,days_mask,enabled
+```
+
+`zone` here is the **0-based device id**; the device is implied by which
+input_text holds the slot, so there is no device prefix. Each device's entries
+are numbered 1..N within its own namespace — devices cannot collide, and slot
+numbers are always sequential and present.
+
+`input_text.<dev>_last_seen_schedule_version` holds HA's last-acknowledged
+device version, for the inbound-pending indicator.
+
+### Aggregator
+`sensor.irrigoto_desired_schedule` walks every device's slots and exposes:
+- `entries` — decoded, for the dashboard table (carries `slot`, `device`, etc.).
+- `per_device_entries` — `{device: [raw entries]}`, the input to the push.
+
+### Pull (device → HA): the mirror
+`<dev>_mirror_device_schedule_to_slots` writes the device's entries into that
+device's slots (positional, skipping a slot whose HA `last_modified` is newer —
+a mid-edit guard). It triggers on the device's REST-sensor change, the
+`schedule_changed` event, the **online edge**, and **HA start**.
+
+On the event/online/start paths it forces a REST re-poll and **waits for the
+poll to actually catch up to the device's `schedule_version`** before reading
+entries — otherwise a stale/partial poll would mirror an incomplete list. While
+a device is asleep the mirror does nothing (it never invents an empty schedule),
+so cached slots persist; the schedule re-appears on the next wake.
+
+### Push (HA → device): upsert-only
+The reconciler builds a `sync_schedule` payload from `per_device_entries`
+(converting zone +1) and calls `esphome.<dev>_sync_schedule`. The device's LWW
+makes unchanged entries no-ops, so HA can re-push freely.
+
+**Upsert-only by default**: the push emits **no tombstones**, so a sync can only
+add/update device entries — never delete them. Deletes are done on the device
+web UI, or deliberately by enabling the overlap-override boolean (which also
+gates the existing "don't push an all-tombstone wipe against a non-empty
+device" guard). This is intentional: HA's mirrored view can briefly be stale or
+partial, and "absent from HA" must never silently delete live device entries.
 
 ### Compose form
+Targets the **active device's** slots. The Slot selector (1–8) picks a slot for
+that device; Save writes `<dev>_sched_<slot>` preserving the existing `id` (so
+an edit updates the same device entry rather than creating a duplicate; an empty
+slot saves `id=0` and the device allocates one). The Zone dropdown lists the
+device's zones as `"Name (#id)"`; that list is cached in
+`input_text.<dev>_zone_cache` so it survives device sleep and HA restarts, and
+the form falls back to the cache when the device is asleep.
 
-When the user saves to a slot from the form:
-- If slot was empty → assign a placeholder `id=0` (device allocates real ID on first sync)
-- If slot had an entry → keep the existing id
-- `last_modified` set to `now() | int` (unix epoch)
+### Pending indicators
+- `sensor.<dev>_schedule_pending_outbound` — HA has edits not yet on the device.
+- `sensor.<dev>_schedule_pending_inbound` — device `schedule_version` is ahead
+  of HA's `last_seen_schedule_version` (HA is pulling).
+- `sensor.irrigoto_schedule_overlap_status` — cross-device time-overlap check.
 
-### Reconciler
+## Design notes (why it's built this way)
 
-Triggered on:
-- Slot edit (any `input_text.irrigoto_sched_*` state change)
-- Device online edge
-- Device schedule_version sensor change
-
-Logic:
-1. If HA's view of `last_seen_version` differs from device's reported
-   `schedule_version`: HA is behind. Fetch device's state via the
-   existing `schedule_text` sensor (or `schedule_changed` payload),
-   reconcile entries by ID, update HA's slots for any device-newer
-   entries. Update `last_seen_version`.
-2. Compute the delta: HA's current entries vs the now-up-to-date
-   `last_seen` snapshot. Any HA entry with newer `last_modified` than
-   device's view is a push candidate. Any device entry no longer in
-   HA (user cleared the slot AND it was a HA-tracked ID) is a
-   tombstone candidate.
-3. Build the sync_schedule payload with push candidates + tombstones
-   + any new (id=0) entries.
-4. If payload is non-empty: call `esphome.<<DEV_USC>>_sync_schedule`.
-5. Device responds via schedule_changed event with new version.
-
-### Pending indicators (dashboard)
-
-Two badges, surfaced separately so the user can tell which direction
-is unsync'd:
-
-| `sensor.<<DEV_USC>>_schedule_pending_outbound` | HA → device |
-| --- | --- |
-| `synced` | No HA-side edits pending |
-| `pending - device asleep` | HA has changes, device offline |
-| `pending - pushing` | HA pushed, awaiting confirmation |
-| `push failed: <reason>` | Last sync_schedule call errored |
-
-| `sensor.<<DEV_USC>>_schedule_pending_inbound` | device → HA |
-| --- | --- |
-| `synced` | `last_seen_version == schedule_version` |
-| `pending - pulling` | `schedule_version > last_seen_version`, HA fetching |
-| `pending - HA offline` | (computed externally) HA was off when device fired event; same root condition surfaces on HA boot |
-
-## Migration
-
-### Device firmware
-
-On first boot of the new firmware:
-- For each existing entry in the NVS blob, assign sequential IDs
-  starting from 1.
-- Set `last_modified = time(NULL)` (or 0 if time not synced yet) for
-  all entries.
-- Set `source = 0` (unknown) for all.
-- Initialize `sched_idnxt = N+1` where N is the highest assigned ID.
-- Initialize `schedule_version = 1`.
-
-After this, the new schema is in place. Old blobs auto-upgrade on
-first boot.
-
-### HA package
-
-On first run:
-- `last_seen_version` per device starts at 0.
-- The first reconciliation pulls device's current schedule (since
-  device's version is >= 1) and populates HA's slots with the IDs
-  device assigned.
-- No data loss — device's pre-existing schedule is preserved, HA's
-  view comes into alignment.
-
-If the user already has HA-side slots populated under the old
-schema, those entries have `id=0` and current `last_modified`, so
-they'll push as new on first sync.
-
-## Out of scope for this design
-
-- Multi-device automation that depends on cross-device awareness
-  (overlap checking already exists; not changed by this work).
-- Algorithmic schedule generation (weather, soil) — design accommodates
-  it via the `source` field, but no implementation here.
-- Schedule history / undo. Single-revision; no audit trail of who
-  changed what when (beyond `last_modified` + `source`).
-- Compression of the wire format for very large schedules. Current
-  CSV with the new fields stays under 100 chars per entry; that's
-  fine for the SCHEDULE_MAX_ENTRIES we have.
-
-## Open questions for implementation
-
-1. Should `time(NULL)` returning < epoch threshold (pre-NTP-sync)
-   block sync? Or accept stale timestamps and let LWW be wrong for
-   a few minutes after wake? Probably accept — bias toward "always
-   sync something" over "wait for clock."
-
-2. If the device's NVS schedule blob fails to parse on boot (corruption),
-   today the code resets `s_schedule.count = 0`. With the new schema,
-   should we attempt to recover individual entries that look valid?
-   Probably no — pre-existing behavior is fine; corrupt blob = empty
-   schedule; user re-adds.
-
-3. The HA-side parse of `schedule_text` to learn device's current state
-   only works if `schedule_text` includes the IDs and timestamps. If
-   the text grows beyond the existing 240-char limit on text_sensor
-   state, we lose data. Mitigations: bump the limit (ESPHome allows
-   up to ~64KB), or add a separate "schedule_export" service that
-   dumps the full blob to a `schedule_full_export` text_sensor on
-   demand. Decide during implementation.
+- **Per-device slots, not one shared pool.** A single shared slot space with
+  per-device positional mapping let two devices collide, leaving entries with no
+  slot number. Per-device namespaces remove the collision entirely.
+- **Upsert-only push.** Deriving deletes from "ids absent in HA's current view"
+  wiped live entries whenever that view was stale or partial. HA no longer
+  auto-deletes.
+- **Pull over an HTTP poll, with a freshness wait.** Entries are read from the
+  device's HTTP API (the event can't carry them). Because the devices deep-sleep
+  and the poll lags, the mirror waits for the poll to reach the device's current
+  `schedule_version` before committing — a fixed delay pulled stale/partial
+  lists.
+- **Zone ±1 at the boundary.** Schedule zones are 1-based on the device but
+  0-based in HA; the conversion lives only at the push/pull boundary.

@@ -74,16 +74,9 @@
 # max to 128 so even devices with long slug names (irrigoto-xxxxxx + a
 # couple-of-digit zone) fit comfortably.
 input_text:
-  irrigoto_sched_1:  {name: "irrigoto schedule slot 1",  max: 128, initial: ""}
-  irrigoto_sched_2:  {name: "irrigoto schedule slot 2",  max: 128, initial: ""}
-  irrigoto_sched_3:  {name: "irrigoto schedule slot 3",  max: 128, initial: ""}
-  irrigoto_sched_4:  {name: "irrigoto schedule slot 4",  max: 128, initial: ""}
-  irrigoto_sched_5:  {name: "irrigoto schedule slot 5",  max: 128, initial: ""}
-  irrigoto_sched_6:  {name: "irrigoto schedule slot 6",  max: 128, initial: ""}
-  irrigoto_sched_7:  {name: "irrigoto schedule slot 7",  max: 128, initial: ""}
-  irrigoto_sched_8:  {name: "irrigoto schedule slot 8",  max: 128, initial: ""}
-  irrigoto_sched_9:  {name: "irrigoto schedule slot 9",  max: 128, initial: ""}
-  irrigoto_sched_10: {name: "irrigoto schedule slot 10", max: 128, initial: ""}
+  # Per-device schedule slots moved to irrigoto_device.yaml
+  # (input_text.<dev>_sched_1..8) so devices no longer collide in one shared
+  # slot space. This file keeps only the device-independent compose helpers.
   # Custom days mask shown in compose form when compose_days = Custom.
   # input_number can't be used (we need it free-form 0..127); using
   # input_text + cast-to-int in the save script.
@@ -148,7 +141,7 @@ input_number:
     name: "irrigoto compose: slot to save/load"
     icon: mdi:numeric
     min: 1
-    max: 10
+    max: 8
     step: 1
     initial: 1
     mode: slider
@@ -196,19 +189,15 @@ script:
     sequence:
       - variables:
           slot: "{{ states('input_number.irrigoto_compose_slot') | int(1) }}"
+          # Active device's underscore slug -> its own slot namespace.
+          usc: "{{ states('input_select.irrigoto_compose_device') | replace('-', '_') }}"
           prev_raw: >-
-            {{ states('input_text.irrigoto_sched_' ~ slot) | default('', true) | trim }}
-          # Extract the prior id if the slot was already populated in the
-          # new format. Defensive against legacy slots (id stays 0 so the
-          # device allocates on first sync).
+            {{ states('input_text.' ~ usc ~ '_sched_' ~ slot) | default('', true) | trim }}
+          # Prior id (first CSV field) so editing a slot UPDATES the same device
+          # entry rather than allocating a new one. 0 = empty/new -> device
+          # allocates an id on first sync.
           prev_id: >-
-            {%- if ',' in prev_raw and '|' in prev_raw -%}
-              {%- set head = prev_raw.split('|', 1)[0] -%}
-              {%- if ',' in head and head.split(',') | length >= 2 -%}
-                {{ head.split(',')[0] | int(0) }}
-              {%- else -%}0{%- endif -%}
-            {%- else -%}0{%- endif -%}
-          dev: "{{ states('input_select.irrigoto_compose_device') }}"
+            {%- if ',' in prev_raw -%}{{ prev_raw.split(',')[0] | int(0) }}{%- else -%}0{%- endif -%}
           # b359: option format is "<name> (#<id>)" (e.g. "N3 (#3)") when
           # the zone dropdown was populated from the device. Extract the
           # numeric id from the "(#N)" suffix. Falls back to int-parsing
@@ -245,12 +234,13 @@ script:
             {%- endif -%}
           enabled_int: "{{ 1 if is_state('input_boolean.irrigoto_compose_enabled', 'on') else 0 }}"
           lm: "{{ now().timestamp() | int(0) }}"
+          # Flat per-device CSV: id,lm,zone,mode,depth,hour,minute,days_mask,enabled
           entry: >-
-            {{ prev_id }},{{ lm }},{{ dev }}|{{ zone }},{{ mode_int }},{{
+            {{ prev_id }},{{ lm }},{{ zone }},{{ mode_int }},{{
             depth_int }},{{ hour }},{{ minute }},{{ days_mask }},{{ enabled_int }}
       - action: input_text.set_value
         target:
-          entity_id: "input_text.irrigoto_sched_{{ slot }}"
+          entity_id: "input_text.{{ usc }}_sched_{{ slot }}"
         data:
           value: "{{ entry }}"
       - action: logbook.log
@@ -282,11 +272,12 @@ script:
     sequence:
       - variables:
           slot: "{{ states('input_number.irrigoto_compose_slot') | int(1) }}"
-          raw: "{{ states('input_text.irrigoto_sched_' ~ slot) | default('', true) }}"
+          usc: "{{ states('input_select.irrigoto_compose_device') | replace('-', '_') }}"
+          raw: "{{ states('input_text.' ~ usc ~ '_sched_' ~ slot) | default('', true) | trim }}"
           quiet_bool: "{{ quiet | default(false) | bool(false) }}"
       - if:
           - condition: template
-            value_template: "{{ '|' not in raw }}"
+            value_template: "{{ raw == '' }}"
         then:
           - if:
               - condition: template
@@ -304,17 +295,7 @@ script:
       # output through `| string` / `| int` keeps everything plain.
       - variables:
           parsed: >-
-            {%- set raw_s = raw | string -%}
-            {%- set bar = raw_s.find('|') -%}
-            {%- set head_s = raw_s[:bar] -%}
-            {%- set csv_s  = raw_s[bar+1:] -%}
-            {%- set hf = head_s.split(',') -%}
-            {%- if hf | length >= 2 -%}
-              {%- set dev_v = hf[2:] | join(',') -%}
-            {%- else -%}
-              {%- set dev_v = head_s -%}
-            {%- endif -%}
-            {%- set f = csv_s.split(',') -%}
+            {%- set f = (raw | string).split(',') -%}
             {%- set MODES = ['Pulse','Gentle','Smooth'] -%}
             {%- set DEPTHS = {1:'1/8"',2:'1/4"',3:'3/8"',4:'1/2"',5:'5/8"',6:'3/4"',7:'7/8"',8:'1"'} -%}
             {%- set INV = {
@@ -323,19 +304,17 @@ script:
               1: 'Sun', 2: 'Mon', 4: 'Tue', 8: 'Wed',
               16: 'Thu', 32: 'Fri', 64: 'Sat'
             } -%}
-            {%- set mask_v = f[5] | int(0) -%}
+            {%- set mask_v = f[7] | int(0) -%}
             {{ {
-              'dev': dev_v | string,
-              'zone': f[0] | string,
-              'mode_name': MODES[f[1] | int(0)],
-              'depth_name': DEPTHS.get(f[2] | int(0), '1/8"'),
-              'hour_s': '%02d' | format(f[3] | int(0)),
-              'minute_s': '%02d' | format(f[4] | int(0)),
+              'zone': f[2] | string,
+              'mode_name': MODES[f[3] | int(0)],
+              'depth_name': DEPTHS.get(f[4] | int(0), '1/8"'),
+              'hour_s': '%02d' | format(f[5] | int(0)),
+              'minute_s': '%02d' | format(f[6] | int(0)),
               'mask': mask_v,
               'days_name': INV.get(mask_v, 'Custom'),
-              'enabled_state': 'on' if (f[6] | int(0)) == 1 else 'off'
+              'enabled_state': 'on' if (f[8] | int(0)) == 1 else 'off'
             } }}
-          dev: "{{ parsed.dev }}"
           mode_name: "{{ parsed.mode_name }}"
           depth_name: "{{ parsed.depth_name }}"
           hour_s: "{{ parsed.hour_s }}"
@@ -344,12 +323,8 @@ script:
           days_name: "{{ parsed.days_name }}"
           enabled_state: "{{ parsed.enabled_state }}"
           zone_s: "{{ parsed.zone }}"
-      - action: input_select.select_option
-        target:
-          entity_id: input_select.irrigoto_compose_device
-        data:
-          option: "{{ dev }}"
-        continue_on_error: true
+      # Device is NOT changed on load: the slot belongs to the already-selected
+      # compose device (per-device slot namespace).
       # b359: stored slot has zone as a number (e.g. "3"). The compose
       # zone dropdown is now populated with "<name> (#<id>)" options
       # (e.g. "N3 (#3)"). Find the option whose "(#N)" suffix matches
@@ -417,12 +392,12 @@ script:
     icon: mdi:close-circle-outline
     mode: single
     sequence:
+      - variables:
+          usc: "{{ states('input_select.irrigoto_compose_device') | replace('-', '_') }}"
+          slot: "{{ states('input_number.irrigoto_compose_slot') | int(1) }}"
       - action: input_text.set_value
         target:
-          entity_id: >-
-            input_text.irrigoto_sched_{{
-              states('input_number.irrigoto_compose_slot') | int(1)
-            }}
+          entity_id: "input_text.{{ usc }}_sched_{{ slot }}"
         data:
           value: ""
       # b359: also reset the compose form to defaults. Without this the
@@ -458,24 +433,27 @@ script:
           domain: sensor
           entity_id: sensor.irrigoto_activity_log
 
-  # Empty ALL slots (nuclear option).
+  # Empty ALL of the ACTIVE device's slots (nuclear option, scoped per-device
+  # since each device owns its own slot namespace now).
   irrigoto_compose_clear_all:
     alias: "irrigoto: clear all schedule slots"
     icon: mdi:delete-sweep-outline
     mode: single
     sequence:
+      - variables:
+          usc: "{{ states('input_select.irrigoto_compose_device') | replace('-', '_') }}"
       - repeat:
-          count: 10
+          count: 8
           sequence:
             - action: input_text.set_value
               target:
-                entity_id: "input_text.irrigoto_sched_{{ repeat.index }}"
+                entity_id: "input_text.{{ usc }}_sched_{{ repeat.index }}"
               data:
                 value: ""
       - action: logbook.log
         data:
           name: irrigoto
-          message: "cleared all 10 schedule slots"
+          message: "cleared all 8 slots for {{ states('input_select.irrigoto_compose_device') }}"
           domain: sensor
           entity_id: sensor.irrigoto_activity_log
 
@@ -502,10 +480,13 @@ template:
         unit_of_measurement: entries
         icon: mdi:calendar-edit
         state: >-
+          {%- set DEVS = <<DEVICE_USC_DASH_MAP>> -%}
           {%- set ns = namespace(c=0) -%}
-          {%- for i in range(1, 11) -%}
-            {%- set s = states('input_text.irrigoto_sched_' ~ i) | default('', true) | trim -%}
-            {%- if s != '' and '|' in s -%}{%- set ns.c = ns.c + 1 -%}{%- endif -%}
+          {%- for usc in DEVS.keys() -%}
+            {%- for i in range(1, 9) -%}
+              {%- set s = states('input_text.' ~ usc ~ '_sched_' ~ i) | default('', true) | trim -%}
+              {%- if s != '' -%}{%- set ns.c = ns.c + 1 -%}{%- endif -%}
+            {%- endfor -%}
           {%- endfor -%}
           {{ ns.c }}
         attributes:
@@ -516,117 +497,74 @@ template:
             {%- set PRESETS = {127:'Daily', 62:'Weekdays', 65:'Weekends', 42:'MWF', 20:'TTh',
                                 1:'Sun', 2:'Mon', 4:'Tue', 8:'Wed', 16:'Thu', 32:'Fri', 64:'Sat'} -%}
             {%- set DLET = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'] -%}
+            {%- set DEVS = <<DEVICE_USC_DASH_MAP>> -%}
             {%- set ns = namespace(entries=[]) -%}
-            {%- for i in range(1, 11) -%}
-              {%- set raw = states('input_text.irrigoto_sched_' ~ i) | default('', true) | trim -%}
-              {%- if raw != '' and '|' in raw -%}
-                {%- set head = raw.split('|', 1)[0] -%}
-                {%- set csv = raw.split('|', 1)[1] -%}
-                {%- set is_new = (',' in head) and (head.split(',') | length >= 2) -%}
-                {%- if is_new -%}
-                  {%- set hf = head.split(',') -%}
-                  {%- set entry_id = hf[0] | int(0) -%}
-                  {%- set entry_lm = hf[1] | int(0) -%}
-                  {%- set dev = hf[2:] | join(',') -%}
-                {%- else -%}
-                  {%- set entry_id = 0 -%}
-                  {%- set entry_lm = 0 -%}
-                  {%- set dev = head -%}
-                {%- endif -%}
-                {%- set f = csv.split(',') -%}
-                {%- if f | length >= 7 -%}
-                  {%- set mask = f[5] | int(0) -%}
-                  {%- if mask in PRESETS -%}
-                    {%- set days_val = PRESETS[mask] -%}
-                  {%- else -%}
-                    {%- set dns = namespace(l=[]) -%}
-                    {%- for b in range(7) -%}
-                      {%- if mask | bitwise_and(2**b) > 0 -%}
-                        {%- set dns.l = dns.l + [DLET[b]] -%}
-                      {%- endif -%}
-                    {%- endfor -%}
-                    {%- set days_val = dns.l -%}
+            {%- for usc, dash in DEVS.items() -%}
+              {%- for i in range(1, 9) -%}
+                {%- set raw = states('input_text.' ~ usc ~ '_sched_' ~ i) | default('', true) | trim -%}
+                {%- if raw != '' -%}
+                  {%- set f = raw.split(',') -%}
+                  {%- if f | length >= 9 -%}
+                    {%- set mask = f[7] | int(0) -%}
+                    {%- if mask in PRESETS -%}
+                      {%- set days_val = PRESETS[mask] -%}
+                    {%- else -%}
+                      {%- set dns = namespace(l=[]) -%}
+                      {%- for b in range(7) -%}
+                        {%- if mask | bitwise_and(2**b) > 0 -%}
+                          {%- set dns.l = dns.l + [DLET[b]] -%}
+                        {%- endif -%}
+                      {%- endfor -%}
+                      {%- set days_val = dns.l -%}
+                    {%- endif -%}
+                    {%- set entry = {
+                      'slot': i,
+                      'id': f[0] | int(0),
+                      'last_modified': f[1] | int(0),
+                      'device': dash,
+                      'zone': f[2] | int(0),
+                      'mode': MODES[f[3] | int(0)],
+                      'depth': DEPTHS.get(f[4] | int(0), '1/8"'),
+                      'time': '%02d:%02d' | format(f[5] | int(0), f[6] | int(0)),
+                      'days': days_val,
+                      'enabled': (f[8] | int(0)) == 1
+                    } -%}
+                    {%- set ns.entries = ns.entries + [entry] -%}
                   {%- endif -%}
-                  {%- set entry = {
-                    'slot': i,
-                    'id': entry_id,
-                    'last_modified': entry_lm,
-                    'device': dev,
-                    'zone': f[0] | int(0),
-                    'mode': MODES[f[1] | int(0)],
-                    'depth': DEPTHS.get(f[2] | int(0), '1/8"'),
-                    'time': '%02d:%02d' | format(f[3] | int(0), f[4] | int(0)),
-                    'days': days_val,
-                    'enabled': (f[6] | int(0)) == 1
-                  } -%}
-                  {%- set ns.entries = ns.entries + [entry] -%}
                 {%- endif -%}
-              {%- endif -%}
+              {%- endfor -%}
             {%- endfor -%}
             {{ ns.entries }}
-          # Legacy: 7-field CSV (no id / lm) per device, kept for older
-          # automations (set_schedule replace-all path).
-          per_device: >-
-            {%- set ns = namespace(pd={}) -%}
-            {%- for i in range(1, 11) -%}
-              {%- set raw = states('input_text.irrigoto_sched_' ~ i) | default('', true) | trim -%}
-              {%- if raw != '' and '|' in raw -%}
-                {%- set head = raw.split('|', 1)[0] -%}
-                {%- set csv = raw.split('|', 1)[1] -%}
-                {%- set is_new = (',' in head) and (head.split(',') | length >= 2) -%}
-                {%- if is_new -%}
-                  {%- set hf = head.split(',') -%}
-                  {%- set dev = hf[2:] | join(',') -%}
-                {%- else -%}
-                  {%- set dev = head -%}
-                {%- endif -%}
-                {%- set existing = ns.pd.get(dev, []) -%}
-                {%- set ns.pd = dict(ns.pd, **{dev: existing + [csv]}) -%}
-              {%- endif -%}
-            {%- endfor -%}
-            {%- set sorted_ns = namespace(pd={}) -%}
-            {%- for dev, csvs in ns.pd.items() -%}
-              {%- set sorted_ns.pd = dict(sorted_ns.pd, **{dev: (csvs | sort | join(';'))}) -%}
-            {%- endfor -%}
-            {{ sorted_ns.pd }}
-          # b355: structured per-device entries with id + last_modified.
-          # Reconciler reads this dict to build the sync_schedule payload.
+          # Structured per-device entries keyed by device dash-slug, sourced
+          # from each device's OWN slots (input_text.<usc>_sched_1..8). The
+          # reconciler reads this to build the sync_schedule payload.
           per_device_entries: >-
+            {%- set DEVS = <<DEVICE_USC_DASH_MAP>> -%}
             {%- set ns = namespace(pd={}) -%}
-            {%- for i in range(1, 11) -%}
-              {%- set raw = states('input_text.irrigoto_sched_' ~ i) | default('', true) | trim -%}
-              {%- if raw != '' and '|' in raw -%}
-                {%- set head = raw.split('|', 1)[0] -%}
-                {%- set csv = raw.split('|', 1)[1] -%}
-                {%- set is_new = (',' in head) and (head.split(',') | length >= 2) -%}
-                {%- if is_new -%}
-                  {%- set hf = head.split(',') -%}
-                  {%- set entry_id = hf[0] | int(0) -%}
-                  {%- set entry_lm = hf[1] | int(0) -%}
-                  {%- set dev = hf[2:] | join(',') -%}
-                {%- else -%}
-                  {%- set entry_id = 0 -%}
-                  {%- set entry_lm = 0 -%}
-                  {%- set dev = head -%}
+            {%- for usc, dash in DEVS.items() -%}
+              {%- set ens = namespace(l=[]) -%}
+              {%- for i in range(1, 9) -%}
+                {%- set raw = states('input_text.' ~ usc ~ '_sched_' ~ i) | default('', true) | trim -%}
+                {%- if raw != '' -%}
+                  {%- set f = raw.split(',') -%}
+                  {%- if f | length >= 9 -%}
+                    {%- set entry = {
+                      'slot': i,
+                      'id': f[0] | int(0),
+                      'last_modified': f[1] | int(0),
+                      'zone': f[2] | int(0),
+                      'mode': f[3] | int(0),
+                      'depth': f[4] | int(0),
+                      'hour': f[5] | int(0),
+                      'minute': f[6] | int(0),
+                      'days_mask': f[7] | int(0),
+                      'enabled': f[8] | int(0)
+                    } -%}
+                    {%- set ens.l = ens.l + [entry] -%}
+                  {%- endif -%}
                 {%- endif -%}
-                {%- set f = csv.split(',') -%}
-                {%- if f | length >= 7 -%}
-                  {%- set entry = {
-                    'slot': i,
-                    'id': entry_id,
-                    'last_modified': entry_lm,
-                    'zone': f[0] | int(0),
-                    'mode': f[1] | int(0),
-                    'depth': f[2] | int(0),
-                    'hour': f[3] | int(0),
-                    'minute': f[4] | int(0),
-                    'days_mask': f[5] | int(0),
-                    'enabled': f[6] | int(0)
-                  } -%}
-                  {%- set existing = ns.pd.get(dev, []) -%}
-                  {%- set ns.pd = dict(ns.pd, **{dev: existing + [entry]}) -%}
-                {%- endif -%}
-              {%- endif -%}
+              {%- endfor -%}
+              {%- set ns.pd = dict(ns.pd, **{dash: ens.l}) -%}
             {%- endfor -%}
             {{ ns.pd }}
 
@@ -760,6 +698,10 @@ automation:
     triggers:
       - trigger: state
         entity_id: input_number.irrigoto_compose_slot
+      # Per-device slots: reload when the active device changes too, so the
+      # form reflects the newly-selected device's slot N (not the old device's).
+      - trigger: state
+        entity_id: input_select.irrigoto_compose_device
     actions:
       - action: script.irrigoto_compose_load_from_slot
         data:

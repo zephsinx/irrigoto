@@ -18,6 +18,8 @@ tools/*
 !tools/ha-regen.py
 !tools/ha-regen.sh
 !tools/extract_factory_cal.py
+# tools/ha-sandbox/ stays LOCAL (gitignored under tools/* above): WSL-specific
+# test tooling with hardcoded /mnt/c paths, not for the public repo.
 
 # ESPHome compile output
 .esphome/
