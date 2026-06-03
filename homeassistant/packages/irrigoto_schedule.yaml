@@ -198,17 +198,36 @@ script:
           # allocates an id on first sync.
           prev_id: >-
             {%- if ',' in prev_raw -%}{{ prev_raw.split(',')[0] | int(0) }}{%- else -%}0{%- endif -%}
+          # b403: stable client_tag (10th CSV field). Preserved across edits like
+          # prev_id; generated once (= creation epoch, a unique-enough uint32)
+          # when the slot is empty/legacy. The device dedups id=0 re-pushes by
+          # this tag, so editing the time of a not-yet-acked entry UPDATES it
+          # instead of spawning a duplicate. See irrigoto.c sync_schedule tag-dedup.
+          prev_tag: >-
+            {%- set pf = (prev_raw | string).split(',') -%}
+            {%- if pf | length > 9 -%}{{ pf[9] | int(0) }}{%- else -%}0{%- endif -%}
           # b359: option format is "<name> (#<id>)" (e.g. "N3 (#3)") when
           # the zone dropdown was populated from the device. Extract the
           # numeric id from the "(#N)" suffix. Falls back to int-parsing
           # the whole string if no "(#" present (legacy "1".."8" options).
+          zone_sel: "{{ states('input_select.irrigoto_compose_zone') | string }}"
           zone: >-
-            {%- set sel = states('input_select.irrigoto_compose_zone') -%}
+            {%- set sel = zone_sel -%}
             {%- if '(#' in sel and ')' in sel -%}
               {{ sel.split('(#')[1].split(')')[0] | int(0) }}
             {%- else -%}
               {{ sel | int(0) }}
             {%- endif -%}
+          # Is the Zone selection a REAL option? Valid = the "Name (#id)" form
+          # OR a legacy bare integer. Anything else ("unknown"/"unavailable"/
+          # empty) means the dropdown has no live device zone list (the device
+          # is asleep, so schedule_rest.zones is empty). The zone parse above
+          # would silently fall through to `sel | int(0)` -> 0 on "unknown",
+          # writing zone 0 and corrupting the entry. The guard below refuses to
+          # save in that case.
+          zone_valid: >-
+            {%- set s = zone_sel -%}
+            {{ ('(#' in s and ')' in s) or s.isdigit() }}
           mode_int: >-
             {{ {'Pulse':0,'Gentle':1,'Smooth':2}.get(
                   states('input_select.irrigoto_compose_mode'), 2) }}
@@ -234,10 +253,32 @@ script:
             {%- endif -%}
           enabled_int: "{{ 1 if is_state('input_boolean.irrigoto_compose_enabled', 'on') else 0 }}"
           lm: "{{ now().timestamp() | int(0) }}"
-          # Flat per-device CSV: id,lm,zone,mode,depth,hour,minute,days_mask,enabled
+          # Keep the prior tag on an edit; mint one (creation epoch) for a new entry.
+          client_tag: "{{ prev_tag if (prev_tag | int(0)) > 0 else (now().timestamp() | int(0)) }}"
+          # Flat per-device CSV: id,lm,zone,mode,depth,hour,minute,days_mask,enabled,tag
           entry: >-
             {{ prev_id }},{{ lm }},{{ zone }},{{ mode_int }},{{
-            depth_int }},{{ hour }},{{ minute }},{{ days_mask }},{{ enabled_int }}
+            depth_int }},{{ hour }},{{ minute }},{{ days_mask }},{{ enabled_int }},{{ client_tag }}
+      # Guard: don't write a corrupted entry when the Zone dropdown has no live
+      # selection. While the device sleeps its zone list (schedule_rest.zones)
+      # is empty, so the picker can read "unknown"/"unavailable"; saving then
+      # used to write zone 0 (the int-parse fallback), silently mis-zoning the
+      # entry and, after the push's +1, watering the wrong zone / colliding with
+      # another. Abort + notify so the user re-saves once the device is awake and
+      # the dropdown shows a real "Name (#id)" value.
+      - if:
+          - condition: template
+            value_template: "{{ not zone_valid }}"
+        then:
+          - action: persistent_notification.create
+            data:
+              title: "irrigoto: save skipped (zone not selected)"
+              message: >-
+                Zone reads "{{ zone_sel }}" -- not a real selection (the device
+                is likely asleep, so its zone list is empty). Nothing was written
+                to slot {{ slot }}. Wake the device so the Zone dropdown shows a
+                "Name (#id)" value, then Save again.
+          - stop: "invalid zone selection -- not saving"
       - action: input_text.set_value
         target:
           entity_id: "input_text.{{ usc }}_sched_{{ slot }}"
@@ -558,7 +599,8 @@ template:
                       'hour': f[5] | int(0),
                       'minute': f[6] | int(0),
                       'days_mask': f[7] | int(0),
-                      'enabled': f[8] | int(0)
+                      'enabled': f[8] | int(0),
+                      'tag': (f[9] | int(0)) if (f | length) > 9 else 0
                     } -%}
                     {%- set ens.l = ens.l + [entry] -%}
                   {%- endif -%}

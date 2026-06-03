@@ -13111,12 +13111,13 @@ static esp_err_t api_schedule_handler(httpd_req_t *req)
         // b355: include id + last_modified + source so HA / web UI can
         // round-trip through sync_schedule without re-keying entries.
         n += snprintf(buf+n, sizeof(buf)-n,
-            "%s{\"id\":%lu,\"last_modified\":%lu,"
+            "%s{\"id\":%lu,\"last_modified\":%lu,\"client_tag\":%lu,"
             "\"zone\":%u,\"mode\":%u,\"depth\":%u,"
             "\"hour\":%u,\"minute\":%u,\"days_mask\":%u,\"enabled\":%u,"
             "\"source\":%u}",
             i ? "," : "",
             (unsigned long)e->id, (unsigned long)e->last_modified,
+            (unsigned long)e->client_tag,
             e->zone, e->mode, e->depth,
             e->hour, e->minute, e->days_mask, e->enabled, e->source);
     }
@@ -13646,6 +13647,7 @@ void app_main(void)
 static void log_wake_cause(void);
 static void pm_nvs_load(void);
 static void schedule_load_nvs(void);
+static void schedule_save_nvs(void);
 static void schedule_delay_load_nvs(void);
 static void last_water_load_nvs(void);
 static void schedule_task(void *arg);
@@ -14451,8 +14453,17 @@ static void schedule_load_nvs(void)
     // First check the blob size to decide which schema to read.
     size_t blob_sz = 0;
     esp_err_t sr = nvs_get_blob(h, "schedule", NULL, &blob_sz);
-    if (sr == ESP_OK && blob_sz == sizeof(s_schedule)) {
-        // New schema — load straight into the live struct.
+    // b403: schema-version key. CRITICAL — the tagged entry (3×u32 + 8×u8 = 20B,
+    // schedule_t = 644B) is the SAME SIZE as the pre-tag entry (2×u32 + 9×u8 incl.
+    // _pad = 20B, also 644B). Size alone CANNOT tell them apart, so loading an old
+    // blob directly would overlay client_tag onto the old source/zone/mode/depth
+    // bytes — silent corruption. Only treat the blob as tagged when this key says
+    // so; pre-b403 firmware never wrote it (schema stays 0 -> v2 migration below).
+    uint32_t schema = 0;
+    nvs_get_u32(h, "sched_schema", &schema);
+    bool migrated = false;   // set by a v1/v2 migration -> resave (w/ schema) below
+    if (sr == ESP_OK && schema >= 3 && blob_sz == sizeof(s_schedule)) {
+        // New (tagged) schema — load straight into the live struct.
         size_t got = blob_sz;
         sr = nvs_get_blob(h, "schedule", &s_schedule, &got);
         if (sr != ESP_OK || got != sizeof(s_schedule) ||
@@ -14488,11 +14499,45 @@ static void schedule_load_nvs(void)
             // s_schedule_id_next will be loaded below if the NVS key exists;
             // otherwise this seed value is used.
             s_schedule_id_next = next_id;
+            migrated = true;
             INFO("Schedule NVS migrated from v1 schema: %u entries (lm=%u, "
                  "id_next=%u)", s_schedule.count, lm, s_schedule_id_next);
         } else {
             ESP_LOGW(TAG, "Legacy schedule read failed (count=%u) -- wiping",
                      old.count);
+        }
+    } else if (sr == ESP_OK && blob_sz == sizeof(schedule_v2_t)) {
+        // b403 migration: pre-tag 16-byte entries -> tagged schema. Copy every
+        // field; client_tag starts at 0 (HA re-stamps a tag on the next edit/
+        // push; until then id/tuple dedup still applies). No data loss — without
+        // this branch the size mismatch below would WIPE the stored schedule on
+        // the upgrade boot.
+        schedule_v2_t old; memset(&old, 0, sizeof(old));
+        size_t got = blob_sz;
+        sr = nvs_get_blob(h, "schedule", &old, &got);
+        memset(&s_schedule, 0, sizeof(s_schedule));
+        if (sr == ESP_OK && got == sizeof(old) && old.count <= SCHEDULE_MAX_ENTRIES) {
+            s_schedule.count = old.count;
+            for (uint8_t i = 0; i < old.count; i++) {
+                schedule_entry_t *e = &s_schedule.entries[i];
+                const schedule_entry_v2_t *o = &old.entries[i];
+                e->id            = o->id;
+                e->last_modified = o->last_modified;
+                e->client_tag    = 0;
+                e->source        = o->source;
+                e->zone          = o->zone;
+                e->mode          = o->mode;
+                e->depth         = o->depth;
+                e->hour          = o->hour;
+                e->minute        = o->minute;
+                e->days_mask     = o->days_mask;
+                e->enabled       = o->enabled;
+            }
+            migrated = true;
+            INFO("Schedule NVS migrated from v2 (pre-tag) schema: %u entries",
+                 s_schedule.count);
+        } else {
+            ESP_LOGW(TAG, "v2 schedule read failed (count=%u) -- wiping", old.count);
         }
     } else if (sr == ESP_OK) {
         ESP_LOGW(TAG, "Schedule NVS blob has unexpected size %u -- wiping",
@@ -14546,6 +14591,12 @@ static void schedule_load_nvs(void)
             INFO("Schedule depth migrated to eighths (%u entries)", s_schedule.count);
         }
     }
+    // b403: if we migrated a v1/v2 blob, persist the tagged blob WITH the schema
+    // key now (schedule_save_nvs stamps sched_schema=3). Otherwise the next boot
+    // would re-run the migration, and — worse — a depth-migration resave above
+    // could leave a tagged-layout blob on disk with schema still 0, which the
+    // next load would misread as pre-tag. Persisting here closes both gaps.
+    if (migrated) schedule_save_nvs();
 }
 
 // Persist schedule blob + version + id_next together so the three stay
@@ -14557,6 +14608,11 @@ static void schedule_save_nvs(void)
     nvs_set_blob(h, "schedule", &s_schedule, sizeof(s_schedule));
     nvs_set_u32 (h, "sched_ver",   s_schedule_version);
     nvs_set_u32 (h, "sched_idnxt", s_schedule_id_next);
+    // b403: stamp the schema version IN THE SAME COMMIT as the blob so the two
+    // stay consistent. The tagged layout is byte-size-identical to the pre-tag
+    // one (both 644B), so schedule_load_nvs() relies on this key — not the blob
+    // size — to know the blob carries client_tag. (3 = tagged schema.)
+    nvs_set_u32 (h, "sched_schema", 3);
     nvs_commit(h);
     nvs_close(h);
 }
@@ -14717,7 +14773,7 @@ bool irrigoto_schedule_set_text(const char *text)
             ESP_LOGW(TAG, "%s", s_sched_last_status);
             return false;
         }
-        if (z < 1 || z > 250 || m < 0 || m > 2 || d < 0 || d > 1 ||
+        if (z < 1 || z > 250 || m < 0 || m > 2 || d < 0 || d > 8 ||
             hh < 0 || hh > 23 || mm < 0 || mm > 59 ||
             days < 0 || days > 127 || en < 0 || en > 1) {
             snprintf(s_sched_last_status, sizeof(s_sched_last_status),
@@ -14816,19 +14872,21 @@ bool irrigoto_schedule_sync_text(const char *text)
     while (*p && next.count < SCHEDULE_MAX_ENTRIES) {
         while (*p == ' ' || *p == '\t' || *p == ';' || *p == '\n' || *p == '\r') p++;
         if (!*p) break;
-        unsigned long id_u, lm_u;
+        unsigned long id_u, lm_u, tag_u = 0;
         int z, m, d, hh, mm, days, en, src, tomb;
-        // 11 fields. Use %lu for the unsigned-32 fields to keep parsing
-        // portable on the device's 32-bit long.
-        int parsed = sscanf(p, "%lu,%lu,%d,%d,%d,%d,%d,%d,%d,%d,%d",
+        // 11 required fields + an OPTIONAL 12th = client_tag (b403). Use %lu for
+        // the unsigned-32 fields to keep parsing portable on the device's 32-bit
+        // long. Accept both 11 (legacy/tagless pusher) and 12 fields.
+        int parsed = sscanf(p, "%lu,%lu,%d,%d,%d,%d,%d,%d,%d,%d,%d,%lu",
                             &id_u, &lm_u, &z, &m, &d, &hh, &mm,
-                            &days, &en, &src, &tomb);
-        if (parsed != 11) {
+                            &days, &en, &src, &tomb, &tag_u);
+        if (parsed != 11 && parsed != 12) {
             snprintf(s_sched_last_status, sizeof(s_sched_last_status),
-                "sync parse failed at \"%.32s\" (expected 11 fields)", p);
+                "sync parse failed at \"%.32s\" (expected 11-12 fields)", p);
             ESP_LOGW(TAG, "%s", s_sched_last_status);
             return false;
         }
+        uint32_t client_tag = (parsed >= 12) ? (uint32_t)tag_u : 0;
         // Range-check non-id fields. id and last_modified are uint32 by
         // construction. tombstone=1 entries with id=0 are dropped (nonsensical).
         if (tomb != 0 && tomb != 1) {
@@ -14838,7 +14896,7 @@ bool irrigoto_schedule_sync_text(const char *text)
             return false;
         }
         if (tomb == 0) {
-            if (z < 1 || z > 250 || m < 0 || m > 2 || d < 0 || d > 1 ||
+            if (z < 1 || z > 250 || m < 0 || m > 2 || d < 0 || d > 8 ||
                 hh < 0 || hh > 23 || mm < 0 || mm > 59 ||
                 days < 0 || days > 127 || en < 0 || en > 1 ||
                 src < 0 || src > 3) {
@@ -14872,6 +14930,24 @@ bool irrigoto_schedule_sync_text(const char *text)
                 applied++;
             }
             continue;
+        }
+
+        // b403: tag-dedup — the robust dedup key. A stable client_tag (assigned
+        // by HA when the entry is created, PRESERVED across edits) survives a
+        // change to the time/zone/days, unlike the (zone,hour,minute,days) tuple
+        // below. So re-pushing an EDITED id=0 entry maps back to the same record
+        // and UPDATES it, instead of allocating a duplicate that overlaps the
+        // original and rejects the whole sync. Checked before the tuple fallback.
+        if (idx < 0 && client_tag != 0) {
+            for (uint8_t i = 0; i < next.count; i++) {
+                if (next.entries[i].client_tag == client_tag) {
+                    ESP_LOGI(TAG, "sync_schedule: tag-dedup, incoming id=%lu tag=%lu mapped to existing id=%lu",
+                             (unsigned long)id, (unsigned long)client_tag,
+                             (unsigned long)next.entries[i].id);
+                    idx = (int)i;
+                    break;
+                }
+            }
         }
 
         // b359: tuple-dedup fallback for non-tombstone inserts. If the
@@ -14917,6 +14993,7 @@ bool irrigoto_schedule_sync_text(const char *text)
             schedule_entry_t e = {
                 .id = new_id,
                 .last_modified = lm ? lm : now_u32,
+                .client_tag = client_tag,
                 .source = (uint8_t)src,
                 .zone = (uint8_t)z, .mode = (uint8_t)m, .depth = (uint8_t)d,
                 .hour = (uint8_t)hh, .minute = (uint8_t)mm,
@@ -14939,6 +15016,10 @@ bool irrigoto_schedule_sync_text(const char *text)
             cur->enabled   = (uint8_t)en;
             cur->source    = (uint8_t)src;
             cur->last_modified = lm;
+            // b403: adopt a (nonzero) incoming tag so an entry created on the
+            // device web UI, or matched by id/tuple, learns its HA tag once HA
+            // starts sending one. Never clobber an existing tag with 0.
+            if (client_tag) cur->client_tag = client_tag;
             applied++;
         }
         // else: device's last_modified >= incoming → keep device.

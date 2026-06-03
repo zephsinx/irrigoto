@@ -1553,10 +1553,13 @@ template:
                   silently blacked out all schedule syncing. -#}
               {%- set zid = e.zone | int(-1) -%}
               {%- if zid >= 0 -%}
+                {#- b403: append the client_tag as the 12th wire field so the
+                    device can dedup id=0 re-pushes by tag (the firmware accepts
+                    11 or 12 fields; legacy/tagless entries send tag 0). -#}
                 {%- set line = (e.id | int(0)) ~ ',' ~ (e.last_modified | int(0)) ~ ','
                                 ~ (zid + 1) ~ ',' ~ e.mode ~ ',' ~ e.depth ~ ','
                                 ~ e.hour ~ ',' ~ e.minute ~ ',' ~ e.days_mask ~ ','
-                                ~ e.enabled ~ ',2,0' -%}
+                                ~ e.enabled ~ ',2,0,' ~ (e.tag | int(0)) -%}
                 {%- set ns.lines = ns.lines + [line] -%}
               {%- endif -%}
             {%- endfor -%}
@@ -2418,16 +2421,67 @@ automation:
                           target:
                             entity_id: "input_text.<<DEV_USC>>_sched_{{ slot_n }}"
                           data:
-                            # Flat CSV id,lm,zone,mode,depth,hour,minute,days_mask,enabled.
+                            # Flat CSV id,lm,zone,mode,depth,hour,minute,days_mask,enabled,tag.
                             # Zone: device schedule is 1-based; HA stores 0-based id
                             # (matches the "(#id)" dropdown + the push side's +1).
+                            # b403: carry the device's client_tag (10th field) so the
+                            # slot keeps it across mirrors and re-pushes stay dedup-able.
                             value: >-
                               {{ dev_e.id }},{{ dev_e.last_modified }},{{
                               [ (dev_e.zone | int(1)) - 1, 0 ] | max }},{{ dev_e.mode
                               }},{{ dev_e.depth }},{{ dev_e.hour }},{{ dev_e.minute
-                              }},{{ dev_e.days_mask }},{{ dev_e.enabled }}
-                # No device entry at this position: clear this device's slot.
-                - conditions: "{{ slot_raw != '' }}"
+                              }},{{ dev_e.days_mask }},{{ dev_e.enabled }},{{ dev_e.client_tag | default(0) | int(0) }}
+                      else:
+                        # HA's slot is NEWER than the device's copy at this
+                        # position — the user just edited it, so we KEEP HA's
+                        # field values. BUT if the slot is still id==0 while the
+                        # device holds a real id for the entry at this position,
+                        # ADOPT that id (keeping HA's lm + edited fields, swapping
+                        # only the id field). Without this, an id==0 slot the user
+                        # edits before the device-assigned id propagates back stays
+                        # id==0 forever (this very lm guard blocks the id from
+                        # flowing back), so every push re-sends id==0 and the
+                        # device ALLOCATES A NEW ENTRY each time — a duplicate at
+                        # the edited time that OVERLAPS the original and gets the
+                        # whole sync rejected ("sync rejected: ... overlaps ...").
+                        # Adopting the id turns the next push into an in-place
+                        # UPDATE. (Same position-correspondence assumption the rest
+                        # of this mirror already relies on; only fires when the
+                        # device actually has an entry here, i.e. one it stored
+                        # from an earlier push of this same slot.)
+                        - if:
+                            - condition: template
+                              value_template: >-
+                                {{ ((slot_raw | string).split(',')[0] | int(0)) == 0
+                                   and (dev_e.id | int(0)) > 0 }}
+                          then:
+                            - action: input_text.set_value
+                              target:
+                                entity_id: "input_text.<<DEV_USC>>_sched_{{ slot_n }}"
+                              data:
+                                # Swap field 0 (id) -> device id; keep lm + all
+                                # edited fields verbatim.
+                                value: >-
+                                  {{ dev_e.id }},{{ (slot_raw | string).split(',')[1:] | join(',') }}
+                # No device entry at this position. Only clear a slot the
+                # device has actually SEEN and then dropped — i.e. one bound to
+                # a real (>0) device-assigned id. A slot with id==0 is a PENDING
+                # HA-side ADD the device has never seen (the user composed it
+                # while the device was asleep / disconnected from HA). The old
+                # unconditional clear here wiped that new entry the instant the
+                # device woke — before the reconciler PUSH (3s debounce) could
+                # deliver it — so it vanished from BOTH sides. (This clear is
+                # effectively an HA-side tombstone; like every destructive op in
+                # the sync path it needs a "the device had a chance to learn the
+                # truth" precondition — see the b357/b359 tombstone-wipe saga.)
+                # Preserve id==0 slots so the PUSH can sync them; the next mirror
+                # poll then rewrites the slot with the device-assigned id.
+                # Device-side deletes always carry a real id, so this guard never
+                # blocks a legitimate delete; HA-side edits to EXISTING entries
+                # are protected separately by the upsert branch's lm guard above.
+                - conditions: >-
+                    {{ slot_raw != ''
+                       and ((slot_raw | string).split(',')[0] | int(0)) > 0 }}
                   sequence:
                     - action: input_text.set_value
                       target:

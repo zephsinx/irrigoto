@@ -104,6 +104,14 @@ typedef struct {
 typedef struct {
     uint32_t id;            // 1-based, stable across edits. 0 = unassigned (wire only).
     uint32_t last_modified; // unix epoch of last edit (0 if never set)
+    uint32_t client_tag;    // b403: stable HA-generated correlation id (0 = none).
+                            //   Assigned once when HA creates an entry and KEPT
+                            //   across edits. Lets the device dedup id=0 re-pushes
+                            //   of an EDITED entry by tag — the tuple key (zone/
+                            //   hour/minute/days) changes when the user edits the
+                            //   time, but the tag does not — and lets HA re-adopt
+                            //   the device-assigned id by tag. 0 for device-web-
+                            //   created or pre-b403 (legacy) entries.
     uint8_t  source;        // 0=unknown, 1=user_device, 2=user_ha, 3=algorithm
     uint8_t  zone;          // 1-based zone number (0 = empty/unused slot)
     uint8_t  mode;          // 0=Pulse, 1=Gentle, 2=Smooth
@@ -114,8 +122,7 @@ typedef struct {
     uint8_t  minute;        // 0-59
     uint8_t  days_mask;     // bit0=Sun, bit1=Mon, ..., bit6=Sat (matches tm_wday)
     uint8_t  enabled;       // 0/1 — disabled entries stay in storage but don't fire
-    uint8_t  _pad;          // explicit padding so sizeof() is a stable 16
-} schedule_entry_t;
+} schedule_entry_t;         // sizeof() == 20 (3×u32 + 8×u8, 4-aligned)
 
 typedef struct {
     uint8_t          count;
@@ -139,3 +146,26 @@ typedef struct {
     uint8_t              count;
     schedule_entry_v1_t  entries[SCHEDULE_MAX_ENTRIES];
 } schedule_v1_t;
+
+// Pre-b403 entry (no client_tag) — the b355 16-byte schema. Kept so the NVS
+// migration in schedule_load_nvs() recognizes the old blob size and promotes
+// each entry into the tagged schema (client_tag=0) instead of wiping. The
+// layout MUST match the old schedule_entry_t byte-for-byte.
+typedef struct {
+    uint32_t id;
+    uint32_t last_modified;
+    uint8_t  source;
+    uint8_t  zone;
+    uint8_t  mode;
+    uint8_t  depth;
+    uint8_t  hour;
+    uint8_t  minute;
+    uint8_t  days_mask;
+    uint8_t  enabled;
+    uint8_t  _pad;
+} schedule_entry_v2_t;      // sizeof() == 16
+
+typedef struct {
+    uint8_t              count;
+    schedule_entry_v2_t  entries[SCHEDULE_MAX_ENTRIES];
+} schedule_v2_t;

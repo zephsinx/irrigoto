@@ -197,7 +197,10 @@ select:focus,input[type="time"]:focus{outline:1px solid var(--green);}
 <script>
 const DAY_LABELS = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
 const MODE_LABELS = ['Pulse','Gentle','Smooth'];
-const DEPTH_LABELS = ['1/8"','1/4"'];
+// Depth is eighths of an inch, indexed by the stored value (1..8); index 0 is
+// an unused placeholder. Deeper targets are achieved as multiple 1/8" passes
+// (same as the other modes), so Smooth is no longer 1/8"-only.
+const DEPTH_LABELS = ['—','1/8&Prime;','1/4&Prime;','3/8&Prime;','1/2&Prime;','5/8&Prime;','3/4&Prime;','7/8&Prime;','1&Prime;'];
 
 let state = {
   zones: [],         // [{id, name}]
@@ -237,7 +240,7 @@ function normalizeEntry(e) {
   return {
     zone: +e.zone || 1,
     mode: +e.mode || 0,
-    depth: +e.depth || 0,
+    depth: +e.depth || 1,   // eighths (1..8); 0/missing -> 1/8"
     hour: +e.hour || 0,
     minute: +e.minute || 0,
     days_mask: +e.days_mask || 0,
@@ -424,9 +427,11 @@ function renderEntry(e, idx) {
           '<option value="2"' + (e.mode===2?' selected':'') + '>Smooth</option>' +
         '</select></div>' +
       '<div class="col"><label>Depth</label>' +
-        '<select data-k="depth"' + (e.mode===2?' disabled title="Smooth uses 1/8″"':'') + '>' +
-          '<option value="0"' + (e.depth===0?' selected':'') + '>1/8&Prime;</option>' +
-          '<option value="1"' + (e.depth===1?' selected':'') + '>1/4&Prime;</option>' +
+        '<select data-k="depth">' +
+          [1,2,3,4,5,6,7,8].map(v =>
+            '<option value="' + v + '"' + (((+e.depth)||1)===v ? ' selected' : '') + '>' +
+            DEPTH_LABELS[v] + '</option>'
+          ).join('') +
         '</select></div>' +
     '</div>' +
     '<div><label style="font-size:10px;letter-spacing:.12em;text-transform:uppercase;color:var(--text-mid);display:block;margin-bottom:4px;">Days</label>' +
@@ -550,7 +555,7 @@ function addEntry() {
   // Sensible defaults: first available zone, Smooth 1/8", 6:00 AM, every day.
   const firstZone = state.zones.length ? state.zones[0].id + 1 : 1;
   state.entries.push({
-    zone: firstZone, mode: 2, depth: 0,
+    zone: firstZone, mode: 2, depth: 1,
     hour: 6, minute: 0,
     days_mask: 127, enabled: 1,
   });
