@@ -1,0 +1,14 @@
+How to make cable to connect to Oto UART
+
+Ttl-232r-3v3-we(1.8m) USB-3.3V TTL serial FTDI
+https://www.amazon.com/dp/B0GFWJPXGP
+
+FPC PCB with 1.0mm spacing 6 pin, remove FPC connector with iron, hot air or hot plate, use PCB to mount JST SH 5 pin connector 
+https://www.amazon.com/dp/B0CLVRNYLT
+
+20 Pairs Mini Micro 5 Pin JST SH 1.0mm Cable Connector, JST SH 1.0mm Pitch 5 Pin Male Female Connector Plug
+Actually only need one connector from this
+https://www.amazon.com/dp/B0BKSM491N
+
+Momentary SMD push button for BOOT
+https://www.amazon.com/Honbay-6x6x4-3mm-Momentary-Switches-Pushbutton/dp/B077N3D7BD
