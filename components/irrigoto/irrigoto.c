@@ -414,6 +414,14 @@ static int dual_vprintf(const char *fmt, va_list ap)
 // Every call site reads these macros, so the offset applies everywhere with no
 // per-site edits. (Verified: no use requires a compile-time constant.)
 static float g_valve_offset_deg = 0.0f;
+// b474: per-unit flow-onset angle (FRAME degrees, i.e. before g_valve_offset_deg
+// is added). The reference unit's flow begins ~43 deg before the peak (263 vs
+// 306.7); other valve bodies open over a different span (ba1f88's new valve:
+// ~56 deg, onset frame ~251). This is INDEPENDENT of the offset -- the offset
+// rotates onset+peak together and can't change the span between them. Default
+// 263 == reference frame, so a unit with no "cstart" key stored (e.g. f9e994,
+// unchanged) behaves exactly as before. POST /cal/valve auto-measures it.
+static float g_valve_cal_start_frame = 263.0f;
 // b418: per-unit valve motor polarity. +1 = reference wiring (driving the
 // physical VFWD pin DECREASES encoder angle / closes), -1 = motor leads
 // swapped. Probed open-loop at the start of POST /cal/valve (before any
@@ -438,7 +446,7 @@ static int8_t g_nozzle_motor_dir = +1;
 #define VALVE_CLOSED_DEG   (231.0f + g_valve_offset_deg)  // valve closed (new side)
 #define VALVE_OPEN_DEG     (308.0f + g_valve_offset_deg)  // valve fully open (peak at 306.7)
 #define VALVE_PEAK_DEG     (306.7f + g_valve_offset_deg)  // angle of maximum nozzle pressure
-#define VALVE_CAL_START_DEG (263.0f + g_valve_offset_deg) // pressure begins rising here
+#define VALVE_CAL_START_DEG (g_valve_cal_start_frame + g_valve_offset_deg) // pressure begins rising here (b474: per-unit, default 263)
 #define VALVE_CAL_STEP_DEG    1.0f   // finer step in active pressure range
 #define WATER_MIN_FLOW_PSI    0.30f  // below this PSI after valve open = no detectable flow, skip ring
 #define WATER_NO_SUPPLY_PSI   2.0f   // b466: 12s supply-check PEAK below this = NO water connected
@@ -1750,6 +1758,18 @@ static void valve_offset_nvs_save(float off)
     nvs_close(h);
 }
 
+// b474: per-unit flow-onset (FRAME deg). Same namespace as the offset so it
+// loads at the same early boot point. Absent key => g_valve_cal_start_frame
+// keeps its 263 default (reference frame; unchanged units unaffected).
+static void valve_cstart_nvs_save(float cstart_frame)
+{
+    nvs_handle_t h;
+    if (nvs_open("vframe", NVS_READWRITE, &h) != ESP_OK) return;
+    nvs_set_blob(h, "cstart", &cstart_frame, sizeof(cstart_frame));
+    nvs_commit(h);
+    nvs_close(h);
+}
+
 // b418/b419: per-unit motor polarity, same namespace (see g_valve_motor_dir /
 // g_nozzle_motor_dir). key = "dir" (valve) or "ndir" (nozzle).
 static void motor_dir_nvs_save(const char *key, int8_t dir)
@@ -1768,11 +1788,24 @@ static void valve_offset_nvs_load(void)
     float off = 0.0f;
     size_t sz = sizeof(off);
     if (nvs_get_blob(h, "off", &off, &sz) == ESP_OK && sz == sizeof(off)) {
-        if (off > -60.0f && off < 60.0f) {
+        if (off > -120.0f && off < 120.0f) {   // b473: ±60 -> ±120 (ba1f88 motor swap re-clocked the magnet ~78 deg)
             g_valve_offset_deg = off;
             INFO("Valve frame offset loaded: %.2f deg", off);
         } else {
             ESP_LOGW(TAG, "Valve frame offset %.2f out of range -- ignoring", off);
+        }
+    }
+    // b474: per-unit flow-onset (frame deg). Plausibility-gated to 30-70 deg
+    // before the peak (frame 306.7) so a garbage read can't lower the floor
+    // into the closed region. Absent/out-of-range => keep the 263 default.
+    float cstart = 0.0f;
+    size_t csz = sizeof(cstart);
+    if (nvs_get_blob(h, "cstart", &cstart, &csz) == ESP_OK && csz == sizeof(cstart)) {
+        if (cstart > 236.7f && cstart < 276.7f) {
+            g_valve_cal_start_frame = cstart;
+            INFO("Valve flow-onset frame loaded: %.2f deg", cstart);
+        } else {
+            ESP_LOGW(TAG, "Valve flow-onset %.2f out of range -- keeping default 263", cstart);
         }
     }
     int8_t dir = 0;
@@ -2263,6 +2296,36 @@ static int cal_do_pressure_scan(pressure_map_t *map, bool is_web)
     map->num_points = n;
     n = cal_post_process_scan(map);
     INFO("Scan complete: %d calibration points.", n);
+
+    // b474/b475: learn the per-unit flow-onset from the finished map so the
+    // NORMAL (web) pressure-cal path calibrates VALVE_CAL_START_DEG too -- not
+    // just /cal/valve (which the web UI never calls). Onset = first map point
+    // at/above ONSET_PSI; stored as frame deg (raw - offset) with a 2 deg bias
+    // toward closed so the floor never sits ABOVE onset (which re-truncates the
+    // short-throw rings -- the ba1f88 5ft-min-throw bug). Gated 30-70 deg before
+    // the peak (frame 306.7). This runs BEFORE the low-anchor seat in
+    // wcal_pressure_task / phase_pressure_cal, so the SAME cal run seats its
+    // short-throw anchor at the corrected (true-onset) opening. A unit that
+    // never re-cals keeps its stored value (or the 263 default), so f9e994 is
+    // untouched until it is itself re-cal'd.
+    {
+        const float ONSET_PSI = 0.45f;   // just above the no-flow floor (0.30)
+        float onset_deg = -1.0f;
+        for (int i = 0; i < n; i++)
+            if (map->pressure_psi[i] >= ONSET_PSI) { onset_deg = map->valve_deg[i]; break; }
+        if (onset_deg > 0.0f) {
+            float cstart_frame = (onset_deg - 2.0f) - g_valve_offset_deg;
+            if (cstart_frame > 236.7f && cstart_frame < 276.7f) {
+                g_valve_cal_start_frame = cstart_frame;
+                valve_cstart_nvs_save(cstart_frame);
+                INFO("Flow-onset learned: %.1f deg (raw) -> cal_start_frame %.1f; floor now %.1f deg",
+                     onset_deg, cstart_frame, VALVE_CAL_START_DEG);
+            } else {
+                INFO("Flow-onset %.1f deg -> frame %.1f out of range -- floor unchanged (%.1f)",
+                     onset_deg, cstart_frame, VALVE_CAL_START_DEG);
+            }
+        }
+    }
 
 #undef WP
 #undef WPF
@@ -14158,6 +14221,14 @@ static esp_err_t cal_valve_handler(httpd_req_t *req)
     g_valve_motor_dir = (int8_t)mdir;
     motor_dir_nvs_save("dir", (int8_t)mdir);
 
+    // b474: seat closed first so the sweep begins BELOW flow onset -- required
+    // to observe the per-unit onset angle. Uses the current offset's closed
+    // (peak-75.7 deg), which is still below onset on both the reference frame
+    // and a re-cal'd unit. The onset capture is additionally guarded on
+    // "started dry", so a wrong first-cal offset can't store a bogus onset.
+    valve_goto_direct(VALVE_CLOSED_DEG, 2.0f, 8000, false);
+    vTaskDelay(pdMS_TO_TICKS(400));
+
     // Phase 1 -- coarse sweep from the current angle. Settle, then read a
     // SETTLED MEDIAN (not an in-motion mean) so transient pressure spikes can't
     // latch the argmax. No upfront flow gate: from closed, pressure is ~0 even
@@ -14167,6 +14238,13 @@ static esp_err_t cal_valve_handler(httpd_req_t *req)
     float deg = start;
     float best_deg = start, best_psi = -1.0f;
     int falling = 0;
+    // b474: flow-onset capture. flow_start = first swept angle whose settled
+    // median crosses ONSET_PSI, trusted only if the FIRST sample was dry (i.e.
+    // we really did start below onset). ONSET_PSI sits just above the no-flow
+    // floor (WATER_MIN_FLOW_PSI 0.30) so noise can't trip it.
+    const float ONSET_PSI = 0.45f;
+    float flow_start = -1.0f;
+    bool  started_dry = false, first_sample = true;
     const float STEP = 3.0f;
     const float SPAN = 120.0f;             // sweep up to start + 120 deg
     for (int i = 0; i < 50 && deg < start + SPAN; i++) {
@@ -14174,6 +14252,8 @@ static esp_err_t cal_valve_handler(httpd_req_t *req)
         vTaskDelay(pdMS_TO_TICKS(1500));            // let motion transients dissipate
         float psi = cal_pressure_settled_median(5);
         if (psi >= 0.0f) {
+            if (first_sample) { started_dry = (psi < ONSET_PSI); first_sample = false; }
+            if (flow_start < 0.0f && started_dry && psi >= ONSET_PSI) flow_start = deg;
             if (psi > best_psi) { best_psi = psi; best_deg = deg; falling = 0; }
             else if (psi < best_psi - 0.40f) { if (++falling >= 3) break; }  // clearly past peak
         }
@@ -14205,7 +14285,7 @@ static esp_err_t cal_valve_handler(httpd_req_t *req)
     best_psi = peak_psi;
 
     float offset = peak - 306.7f;
-    if (offset <= -60.0f || offset >= 60.0f) {
+    if (offset <= -120.0f || offset >= 120.0f) {   // b473: ±60 -> ±120 (motor swap can re-clock the magnet, e.g. ba1f88 ~-78 deg)
         // Implausible -- don't store, but still park closed by ball geometry.
         valve_goto_direct(peak - 90.0f, 2.0f, 10000, false);
         motor_rail_off();
@@ -14220,16 +14300,34 @@ static esp_err_t cal_valve_handler(httpd_req_t *req)
     g_valve_offset_deg = offset;
     valve_offset_nvs_save(offset);
 
+    // b474: store the per-unit flow-onset (FRAME deg = raw - offset). Captured
+    // only if we cleanly started dry; a 2 deg bias toward closed keeps the
+    // resulting floor at/just-below true onset (never above it, which would
+    // re-truncate the short-throw rings). Plausibility-gated 30-70 deg before
+    // the peak. If not captured/implausible, the prior value (or 263 default)
+    // stands -- so a unit that never re-cals is unaffected.
+    float cstart_frame = 0.0f; bool cstart_stored = false;
+    if (started_dry && flow_start > 0.0f) {
+        cstart_frame = (flow_start - 2.0f) - offset;
+        if (cstart_frame > 236.7f && cstart_frame < 276.7f) {
+            g_valve_cal_start_frame = cstart_frame;
+            valve_cstart_nvs_save(cstart_frame);
+            cstart_stored = true;
+        }
+    }
+
     // Park fully closed: 90 deg back from the pressure peak (ball geometry).
     float closed = peak - 90.0f;
     valve_goto_direct(closed, 2.0f, 10000, true);
     motor_rail_off();
 
-    char buf[200];
+    char buf[280];
     int n = snprintf(buf, sizeof(buf),
         "{\"ok\":true,\"peak_deg\":%.2f,\"offset\":%.2f,\"closed_deg\":%.2f,"
-        "\"max_psi\":%.3f,\"motor_dir\":%d}",
-        peak, offset, closed, best_psi, (int)g_valve_motor_dir);
+        "\"max_psi\":%.3f,\"motor_dir\":%d,\"flow_start_deg\":%.2f,"
+        "\"cal_start_frame\":%.2f,\"cal_start_stored\":%s}",
+        peak, offset, closed, best_psi, (int)g_valve_motor_dir,
+        flow_start, g_valve_cal_start_frame, cstart_stored ? "true" : "false");
     httpd_resp_send(req, buf, n);
     return ESP_OK;
 }
@@ -14247,8 +14345,8 @@ static esp_err_t cal_valve_set_handler(httpd_req_t *req)
         return ESP_OK;
     }
     float off = strtof(v, NULL);
-    if (off <= -60.0f || off >= 60.0f) {
-        httpd_resp_sendstr(req, "{\"error\":\"offset out of range (-60,60)\"}");
+    if (off <= -120.0f || off >= 120.0f) {   // b473: ±60 -> ±120 (magnet re-clock on motor swap)
+        httpd_resp_sendstr(req, "{\"error\":\"offset out of range (-120,120)\"}");
         return ESP_OK;
     }
     g_valve_offset_deg = off;
@@ -14257,6 +14355,34 @@ static esp_err_t cal_valve_set_handler(httpd_req_t *req)
     int n = snprintf(buf, sizeof(buf),
         "{\"ok\":true,\"offset\":%.2f,\"closed_deg\":%.2f,\"open_deg\":%.2f,\"peak_deg\":%.2f}",
         off, 231.0f + off, 308.0f + off, 306.7f + off);
+    httpd_resp_send(req, buf, n);
+    return ESP_OK;
+}
+
+// b474: set the per-unit flow-onset frame angle directly (no sweep), mirroring
+// /cal/valve/set. Escape hatch for hand-tuning the minimum-open floor. The
+// value is in FRAME degrees (default 263 = reference; lower = valve opens
+// sooner). POST /cal/valve/start/set?deg=<frame_deg>
+static esp_err_t cal_valve_start_set_handler(httpd_req_t *req)
+{
+    httpd_resp_set_type(req, "application/json");
+    char qs[48] = {0}; httpd_req_get_url_query_str(req, qs, sizeof(qs));
+    char v[16] = {0};
+    if (httpd_query_key_value(qs, "deg", v, sizeof(v)) != ESP_OK) {
+        httpd_resp_sendstr(req, "{\"error\":\"missing deg (frame degrees, ~236-277)\"}");
+        return ESP_OK;
+    }
+    float cs = strtof(v, NULL);
+    if (cs <= 236.7f || cs >= 276.7f) {
+        httpd_resp_sendstr(req, "{\"error\":\"out of range (236.7,276.7) -- must be 30-70 deg before peak 306.7\"}");
+        return ESP_OK;
+    }
+    g_valve_cal_start_frame = cs;
+    valve_cstart_nvs_save(cs);
+    char buf[140];
+    int n = snprintf(buf, sizeof(buf),
+        "{\"ok\":true,\"cal_start_frame\":%.2f,\"cal_start_deg\":%.2f}",
+        cs, cs + g_valve_offset_deg);
     httpd_resp_send(req, buf, n);
     return ESP_OK;
 }
@@ -15337,7 +15463,7 @@ static void zone_web_start(void)
     httpd_config_t cfg   = HTTPD_DEFAULT_CONFIG();
     cfg.server_port      = ZONE_WEB_PORT;
     cfg.ctrl_port        = ZONE_WEB_CTRL_PORT;
-    cfg.max_uri_handlers  = 66;  // MUST be set before httpd_start (cfg is copied there);
+    cfg.max_uri_handlers  = 68;  // MUST be set before httpd_start (cfg is copied there);
                                  // headroom over uris[] count -- _Static_assert below guards it.
                                  // (b378: was 40 and silently dropped every handler past #40,
                                  //  including /valve/probe and all /fs/* -- the post-start
@@ -15414,13 +15540,14 @@ static void zone_web_start(void)
         {.uri="/zone/trace",            .method=HTTP_POST, .handler=zone_trace_handler},      // b417
         {.uri="/cal/valve",             .method=HTTP_POST, .handler=cal_valve_handler},   // b389
         {.uri="/cal/valve/set",         .method=HTTP_POST, .handler=cal_valve_set_handler}, // b390
+        {.uri="/cal/valve/start/set",   .method=HTTP_POST, .handler=cal_valve_start_set_handler}, // b474
         {.uri="/fs",                    .method=HTTP_GET,  .handler=fs_page_handler},
         {.uri="/fs/list",               .method=HTTP_GET,  .handler=fs_list_handler},
         {.uri="/fs/download",           .method=HTTP_GET,  .handler=fs_download_handler},
         {.uri="/fs/upload",             .method=HTTP_POST, .handler=fs_upload_handler},
         {.uri="/fs/delete",             .method=HTTP_POST, .handler=fs_delete_handler},
     };
-    _Static_assert(sizeof(uris)/sizeof(uris[0]) <= 64,
+    _Static_assert(sizeof(uris)/sizeof(uris[0]) <= 66,
                    "uris[] exceeds cfg.max_uri_handlers -- raise it before httpd_start");
     for (size_t i = 0; i < sizeof(uris)/sizeof(uris[0]); i++)
         httpd_register_uri_handler(s_zone_server, &uris[i]);
